@@ -1,0 +1,8 @@
+bin/
+dist/
+ci-*.log
+*.test
+*.out
+.DS_Store
+.claude/
+/pgsafe

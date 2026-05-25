@@ -1,0 +1,127 @@
+[2J[H[1;36m### pgSafe — same tool, two shapes, 10 M-row backup head-to-head
+###
+### Same pgsafe binary. Same source cluster. Same encrypted POSIX repo.
+### Run 1: PG-native shape (libpq → pg_basebackup under the hood, single connection).
+### Run 2: pgSafe shape  (worker on PG host, 4 StreamFile RPCs in parallel over one SSH session).
+### Shape is inferred from config: pg.host unset → PG-native; --ssh-target set → pgSafe-mode.
+[0m
+
+[1;36m# Confirm the PG host is reachable.[0m
+[1;32moperator$[0m psql "$PGSAFE_DEMO_SUPER_DSN" -c 'select version();' | head -3
+                                                      version                                                       
+--------------------------------------------------------------------------------------------------------------------
+ PostgreSQL 18.3 (Debian 18.3-1.pgdg13+1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+
+[1;36m# Show the operator's pgsafe config (no --mode flag — shape comes from pg.host vs --ssh-target).[0m
+[1;32moperator$[0m cat /tmp/pgsafe-demo-config/pgsafe.yaml
+server: demo
+pg:
+  conn_string: "postgresql://postgres:postgres@localhost:35197/postgres?sslmode=disable"
+  version: 18
+storage:
+  type: posix
+  path: /tmp/TestHoldFixture2477862277/002/storage
+compression:
+  codec: gzip
+  level: 0
+encryption:
+  recipients:
+    - "age16s58sh3jswqe78gr8gcsh67xqn9fx7u4gg8qqx688wejvgxpxs0str7857"
+log:
+  format: text
+  level: info
+
+[1;36m# Initialise the repo on the orchestrator side.[0m
+[1;32moperator$[0m ./bin/pgsafe --config /tmp/pgsafe-demo-config/pgsafe.yaml server add
+server "demo" initialized at /tmp/TestHoldFixture2477862277/002/storage
+
+[1;36m# Seed a 10-million-row dataset (~700 MB on disk after CHECKPOINT).[0m
+[1;32moperator$[0m psql "$PGSAFE_DEMO_SUPER_DSN" -c 'CREATE EXTENSION IF NOT EXISTS amcheck; CREATE TABLE demo(id int primary key, body text); INSERT INTO demo SELECT g, repeat(chr(96+g%26),80) FROM generate_series(1,10000000) g; CHECKPOINT;'
+CREATE EXTENSION
+CREATE TABLE
+INSERT 0 10000000
+CHECKPOINT
+
+[1;36m# Confirm size on disk.[0m
+[1;32moperator$[0m psql "$PGSAFE_DEMO_SUPER_DSN" -At -c "SELECT pg_size_pretty(pg_database_size('postgres'));"
+1338 MB
+
+[1;36m# Run 1 — PG-native baseline. No --ssh-target, no --workers — simple mode is inferred.[0m
+[1;32moperator$[0m time ./bin/pgsafe --config /tmp/pgsafe-demo-config/pgsafe.yaml backup
+pgsafe backup: starting id=20260429T232117F mode=simple server=demo
+pgsafe backup: WAL archive reachability probe: OK
+pgsafe backup: pg_basebackup complete: 975 files, 1419020704 bytes; startLSN=0/80000028 timeline=1
+pgsafe backup: stop LSN: 0/81000000; WAL-wait for segments containing [0/80000028, 0/81000000] in /tmp/TestHoldFixture2477862277/002/storage/wal
+pgsafe backup: waiting for WAL segments: [000000010000000000000080]
+pgsafe backup: WAL-wait done
+backup 20260429T232117F complete: 975 files, 1419020704 bytes, start=0/80000028 stop=0/81000000, duration=28.429131109s
+real 28.475 seconds
+
+[1;36m# All the SSH knobs live in one ssh_config file — pgsafe just consumes it.[0m
+[1;32moperator$[0m cat /tmp/pgsafe-demo-config/ssh_config
+Host pg-host
+    HostName localhost
+    Port 35196
+    User pgsafe
+    IdentityFile /tmp/TestHoldFixture2477862277/001/id_ed25519
+    UserKnownHostsFile /tmp/TestHoldFixture2477862277/002/known_hosts
+    StrictHostKeyChecking yes
+    BatchMode yes
+
+[1;36m# Run 2 — pgSafe shape. --ssh-target makes pgsafe spawn a worker on the PG host; --workers=4 fans out StreamFile RPCs over a single SSH session.[0m
+[1;32moperator$[0m time ./bin/pgsafe --config /tmp/pgsafe-demo-config/pgsafe.yaml backup \
+  --storage-on=orchestrator --workers=4 --ssh-target=pg-host \
+  --ssh-extra-args='-F /tmp/pgsafe-demo-config/ssh_config' \
+  --remote-command='sudo -u postgres -E /tmp/pgsafe worker stdio'
+pgsafe backup: topology
+  mode    = pgSafe (worker on ssh pg-host)
+  storage = posix:///tmp/TestHoldFixture2477862277/002/storage
+  reach   = via caller (worker → caller → POSIX storage)
+  workers = 4
+  backup-id = 20260429T232158F
+pgsafe backup: WAL archive reachability probe: OK
+pgsafe backup: bracket.Start: lsn=0/99012AD8 timeline=1
+pgsafe backup: discovered 977 files in $PGDATA
+pgsafe backup: worker pgdata: /var/lib/postgresql/18/docker
+pgsafe backup: sftp-tunnel: caller serving /tmp/TestHoldFixture2477862277/002/storage on 127.0.0.1:37637, worker dials its loopback:56865
+pgsafe backup: worker hello: version=v0.0.0-dev os=linux pgdata= numcpu=16
+pgsafe backup: worker→storage probe: REACHABLE (21ms)
+pgsafe backup: bracket.Stop: lsn=0/B8C70898
+pgsafe backup: WAL-wait segments: [000000010000000000000099 00000001000000000000009A 00000001000000000000009B 00000001000000000000009C 00000001000000000000009D 00000001000000000000009E 00000001000000000000009F 0000000100000000000000A0 0000000100000000000000A1 0000000100000000000000A2 0000000100000000000000A3 0000000100000000000000A4 0000000100000000000000A5 0000000100000000000000A6 0000000100000000000000A7 0000000100000000000000A8 0000000100000000000000A9 0000000100000000000000AA 0000000100000000000000AB 0000000100000000000000AC 0000000100000000000000AD 0000000100000000000000AE 0000000100000000000000AF 0000000100000000000000B0 0000000100000000000000B1 0000000100000000000000B2 0000000100000000000000B3 0000000100000000000000B4 0000000100000000000000B5 0000000100000000000000B6 0000000100000000000000B7 0000000100000000000000B8]
+backup 20260429T232158F complete: 977 files, 1419234547 bytes, start=0/99012AD8 stop=0/B8C70898, duration=19.084201722s
+real 19.119 seconds
+
+[1;36m# Both backups landed in the same encrypted repo.[0m
+[1;32moperator$[0m ./bin/pgsafe --config /tmp/pgsafe-demo-config/pgsafe.yaml info
+ID                TYPE  PARENT  SERVER  SIZE     FILES  AGE  ANNOTATION
+20260429T232117F  full  -       demo    1.3 GiB  975    1m   
+20260429T232158F  full  -       demo    1.3 GiB  978    4s   
+
+[1;36m# Decrypt + decompress + sha256 every stored file end-to-end (proves both runs round-trip).[0m
+[1;32moperator$[0m ./bin/pgsafe --config /tmp/pgsafe-demo-config/pgsafe.yaml verify --identity-file=/tmp/pgsafe-demo-age.key
+20260429T232158F  OK  files=978/978  manifest=ok
+20260429T232117F  OK  files=975/975  manifest=ok
+
+[1;36m# Restore the most recent (pgSafe-mode) backup into a fresh PGDATA directory.[0m
+[1;32moperator$[0m rm -rf /tmp/pgsafe-demo-restore && install -d -m 0700 /tmp/pgsafe-demo-restore
+[1;32moperator$[0m ./bin/pgsafe --config /tmp/pgsafe-demo-config/pgsafe.yaml restore --target=/tmp/pgsafe-demo-restore --identity-file=/tmp/pgsafe-demo-age.key
+restore 20260429T232158F: 978 files, 203 WAL segments, 1419234760 bytes
+
+[1;36m# Start PG against the restored cluster on port 55432 and query the seeded table.[0m
+[1;32moperator$[0m echo "restore_command = 'cp $PGSAFE_DEMO_WAL_ARCHIVE/%f %p'" >> /tmp/pgsafe-demo-restore/postgresql.auto.conf
+[1;32moperator$[0m /usr/lib/postgresql/18/bin/pg_ctl -D /tmp/pgsafe-demo-restore -l /tmp/pgsafe-demo-restore.log -o '-p 55432 -c unix_socket_directories=/tmp' -w start
+waiting for server to start..... done
+server started
+[1;32moperator$[0m psql -h localhost -p 55432 -U postgres -d postgres -c 'SELECT count(*) AS rows FROM demo;'
+   rows   
+----------
+ 10000000
+(1 row)
+
+
+[1;36m# pg_amcheck walks heap + indexes on the live restored cluster — structural integrity check.[0m
+[1;32moperator$[0m /usr/lib/postgresql/18/bin/pg_amcheck -h localhost -p 55432 -U postgres -d postgres --heapallindexed && echo '(no errors reported)'
+(no errors reported)
+[1;32moperator$[0m /usr/lib/postgresql/18/bin/pg_ctl -D /tmp/pgsafe-demo-restore stop -m fast >/dev/null
+
+[1;36m### Done. Same source, same encrypted repo — pgSafe shape finished in a fraction of PG-native's time, and the restored cluster passes amcheck.[0m
